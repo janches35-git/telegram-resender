@@ -1,0 +1,5 @@
+streamlit
+telethon
+qrcode
+pillow
+asyncio
