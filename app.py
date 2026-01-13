@@ -1,177 +1,220 @@
 import streamlit as st
 import asyncio
 import qrcode
-from PIL import Image
+import io  # <--- IMPORTANTE: Necesario para convertir la imagen a bytes
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterVideo, MessageService
+from telethon.errors import ApiIdInvalidError, SessionPasswordNeededError
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Migrador Telegram Web", page_icon="📲", layout="centered")
+# --- CONFIGURACIÓN VISUAL ---
+st.set_page_config(page_title="Migrador Telegram Pro", page_icon="✈️", layout="wide")
 
-# --- ESTILOS CSS PARA QUE SE VEA BIEN ---
+# CSS para imitar la consola negra
 st.markdown("""
     <style>
-    .stButton>button {width: 100%; border-radius: 5px; height: 3em;}
-    .success {color: #2e7d32; font-weight: bold;}
+    .stButton>button {width: 100%; border-radius: 5px; font-weight: bold;}
+    .log-box {
+        background-color: #0e1117;
+        color: #00ff00;
+        font-family: 'Courier New', Courier, monospace;
+        padding: 15px;
+        border-radius: 5px;
+        height: 500px;
+        overflow-y: scroll;
+        border: 1px solid #333;
+        font-size: 12px;
+        white-space: pre-wrap;
+    }
     </style>
 """, unsafe_allow_html=True)
 
-# --- GESTIÓN DE ESTADO (MEMORIA) ---
-if "client" not in st.session_state:
-    st.session_state.client = None
-if "is_logged_in" not in st.session_state:
-    st.session_state.is_logged_in = False
-if "chats" not in st.session_state:
-    st.session_state.chats = {}
+# --- ESTADO (MEMORIA) ---
+if "client" not in st.session_state: st.session_state.client = None
+if "chats" not in st.session_state: st.session_state.chats = {}
+if "logs" not in st.session_state: st.session_state.logs = ["--- SISTEMA LISTO ---"]
+if "is_connected" not in st.session_state: st.session_state.is_connected = False
 
 # --- FUNCIONES ---
-def generar_imagen_qr(url):
-    qr = qrcode.QRCode(box_size=10, border=4)
+def add_log(texto):
+    """Añade texto a la consola virtual"""
+    st.session_state.logs.append(f">> {texto}")
+
+def get_qr_image(url):
+    """Genera el QR y lo convierte a BYTES para que Streamlit no falle"""
+    qr = qrcode.QRCode(box_size=10, border=2)
     qr.add_data(url)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    return img
-
-async def proceso_login_qr(api_id, api_hash):
-    """Maneja la lógica del QR con Telethon"""
-    client = TelegramClient(StringSession(), int(api_id), api_hash)
-    await client.connect()
     
-    if not await client.is_user_authorized():
-        # Generamos QR
-        qr_login = await client.qr_login()
-        
-        # Mostramos QR en la Web
-        img = generar_imagen_qr(qr_login.url)
-        st.session_state.qr_placeholder.image(img, caption="Escanea con Telegram > Ajustes > Dispositivos", width=250)
-        st.info("⏳ Tienes unos 30 segundos para escanear...")
-        
-        # Esperamos el escaneo
-        try:
-            # wait() bloquea hasta que se escanea
-            await qr_login.wait()
-            return client
-        except Exception as e:
-            st.error(f"El QR caducó o hubo un error: {e}")
-            return None
-    else:
-        return client
+    # Generar imagen PIL
+    img_pil = qr.make_image(fill_color="black", back_color="white")
+    
+    # --- LA CORRECCIÓN ESTÁ AQUÍ ---
+    # Convertimos la imagen a un stream de bytes (como un archivo en memoria)
+    img_byte_arr = io.BytesIO()
+    img_pil.save(img_byte_arr, format='PNG')
+    img_byte_arr = img_byte_arr.getvalue()
+    
+    return img_byte_arr
 
-async def get_chats(client):
+async def login_process(api_id, api_hash):
+    """Proceso de login robusto"""
+    try:
+        client = TelegramClient(StringSession(), int(api_id), api_hash)
+        await client.connect()
+    except Exception as e:
+        return None, f"Error de conexión inicial: {e}"
+
+    if not await client.is_user_authorized():
+        try:
+            qr_login = await client.qr_login()
+            return client, qr_login
+        except ApiIdInvalidError:
+            return None, "❌ ERROR CRÍTICO: El API ID o el HASH son incorrectos."
+        except Exception as e:
+            return None, f"Error generando QR: {e}"
+    
+    return client, "AUTHORIZED"
+
+async def fetch_chats(client):
     dialogs = await client.get_dialogs(limit=None)
     chat_map = {}
     for d in dialogs:
-        # Filtramos para que salgan chats, canales y grupos
         if d.is_group or d.is_channel or d.is_user:
-            clean_name = d.name.strip() or "Sin Nombre"
-            chat_map[f"{clean_name} (ID: {d.id})"] = d
+            icono = "👥" if d.is_group else ("📢" if d.is_channel else "👤")
+            name = d.name.strip() or "Sin Nombre"
+            label = f"{icono} {name}"
+            chat_map[f"{label} (ID: {d.id})"] = d
     return chat_map
 
-async def migrar(client, origen, destino, progress_bar, status_text):
+async def run_migration(client, ori, dest, status_slot):
     cnt = 0
-    async for message in client.iter_messages(origen, reverse=True):
-        # Filtros de seguridad
-        if isinstance(message, MessageService): continue # Ignorar mensajes de sistema
-        if message.web_preview: continue # Ignorar links con vista previa
-        if not (message.photo or message.video): continue # Solo multimedia
-        
-        try:
-            await client.forward_messages(destino, message)
-            cnt += 1
-            status_text.text(f"🚀 Moviendo archivo #{cnt}...")
-        except Exception as e:
-            # Si hay FloodWait (espera obligatoria), esperamos y reintentamos una vez
-            if "seconds" in str(e):
-                import re
-                sec = int(re.search(r'\d+', str(e)).group())
-                status_text.warning(f"⏳ Telegram pide pausa de {sec}s...")
-                await asyncio.sleep(sec)
-                await client.forward_messages(destino, message)
+    try:
+        async for msg in client.iter_messages(ori, reverse=True):
+            if isinstance(msg, MessageService) or msg.web_preview: continue
+            if not (msg.photo or msg.video): continue
+
+            try:
+                await client.forward_messages(dest, msg)
                 cnt += 1
-            else:
-                pass
+                if cnt % 5 == 0:
+                    status_slot.text(f"🚀 Moviendo archivo #{cnt}...")
+            except Exception as e:
+                if "seconds" in str(e):
+                    import re
+                    try:
+                        sec = int(re.search(r'\d+', str(e)).group())
+                    except: sec = 10
+                    status_slot.warning(f"⏳ Pausa obligatoria de {sec}s...")
+                    await asyncio.sleep(sec)
+                    await client.forward_messages(dest, msg)
+                    cnt += 1
+    except Exception as e:
+        status_slot.error(f"Error en bucle: {e}")
+    
     return cnt
 
-# ================= INTERFAZ DE USUARIO =================
+# ================= LAYOUT PRINCIPAL =================
+col_izq, col_der = st.columns([1, 1])
 
-st.title("📲 Migrador Telegram (Cloud)")
+# --- DERECHA (LOG) ---
+with col_der:
+    st.markdown("### 📝 Registro de Actividad")
+    log_content = "\n".join(st.session_state.logs)
+    st.markdown(f'<div class="log-box">{log_content}</div>', unsafe_allow_html=True)
 
-# --- FASE 1: LOGIN ---
-if not st.session_state.is_logged_in:
-    st.markdown("### 1. Iniciar Sesión")
-    st.warning("⚠️ Streamlit Cloud es público. Usa esto solo para migraciones puntuales y no compartas la URL mientras lo usas.")
+# --- IZQUIERDA (CONTROLES) ---
+with col_izq:
+    st.title("✨ Migrador Telegram")
     
-    col1, col2 = st.columns(2)
-    api_id = col1.text_input("API ID")
-    api_hash = col2.text_input("API Hash", type="password")
-    
-    st.session_state.qr_placeholder = st.empty() # Hueco reservado para el QR
-    
-    if st.button("Generar Código QR"):
-        if not api_id or not api_hash:
-            st.error("Faltan credenciales.")
-        else:
-            # Ejecutamos el loop asíncrono
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            client = loop.run_until_complete(proceso_login_qr(api_id, api_hash))
-            
-            if client and loop.run_until_complete(client.is_user_authorized()):
-                st.session_state.client = client
-                st.session_state.is_logged_in = True
-                # Descargar chats de una vez
-                chats = loop.run_until_complete(get_chats(client))
-                st.session_state.chats = chats
-                st.rerun() # Recargar página para mostrar Fase 2
+    # CREDENCIALES
+    with st.expander("🔑 Credenciales", expanded=not st.session_state.is_connected):
+        api_id = st.text_input("API ID")
+        api_hash = st.text_input("API Hash", type="password")
 
-# --- FASE 2: PANEL DE CONTROL ---
-else:
-    st.success("✅ ¡Conectado correctamente!")
-    
-    # Mostrar StringSession por seguridad (para no tener que escanear siempre)
-    with st.expander("🔑 Ver mi 'Llave de Sesión' (Guardar para futuro)", expanded=False):
-        client = st.session_state.client
-        # Truco para sacar la session string en entorno sync
-        session_str = client.session.save()
-        st.code(session_str)
-        st.caption("Si guardas este código, la próxima vez podrías hacer un login directo sin QR (requiere adaptar el script).")
-
-    st.markdown("### 2. Configurar Migración")
-    
-    if st.session_state.chats:
-        nombres_chats = list(st.session_state.chats.keys())
-        
-        col_a, col_b = st.columns(2)
-        origen_key = col_a.selectbox("📤 Desde (Origen)", nombres_chats)
-        destino_key = col_b.selectbox("📥 Hacia (Destino)", nombres_chats)
-        
-        if st.button("🚀 COMENZAR MIGRACIÓN"):
-            if origen_key == destino_key:
-                st.error("Origen y Destino no pueden ser iguales.")
+    # BOTÓN CONEXIÓN
+    if not st.session_state.is_connected:
+        if st.button("🔌 CONECTAR Y GENERAR QR", type="primary"):
+            if not api_id or not api_hash:
+                st.error("Faltan datos.")
             else:
-                chat_ori = st.session_state.chats[origen_key]
-                chat_dest = st.session_state.chats[destino_key]
-                
-                st.divider()
-                progress = st.progress(0)
-                status = st.empty()
-                
-                # Ejecutar migración
+                add_log("Iniciando conexión...")
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 
-                # Reconectar cliente al nuevo loop (necesario en streamlit)
-                # Usamos la sesión que ya tenemos en memoria
+                try:
+                    client_temp, result = loop.run_until_complete(login_process(api_id, api_hash))
+                    
+                    if client_temp is None:
+                        st.error(result)
+                        add_log(result)
+                    elif result == "AUTHORIZED":
+                        st.session_state.client = client_temp
+                        st.session_state.is_connected = True
+                        add_log("✅ Conexión directa exitosa.")
+                        chats = loop.run_until_complete(fetch_chats(client_temp))
+                        st.session_state.chats = chats
+                        st.rerun()
+                    else:
+                        # QR LOGIN
+                        qr_login_obj = result
+                        st.session_state.client = client_temp
+                        
+                        # AQUI USAMOS LA NUEVA FUNCION DE QR QUE DEVUELVE BYTES
+                        img_bytes = get_qr_image(qr_login_obj.url)
+                        
+                        st.image(img_bytes, width=250, caption="ESCANEA RÁPIDO")
+                        st.info("⏳ Esperando escaneo...")
+                        add_log("QR Generado. Esperando usuario...")
+                        
+                        try:
+                            loop.run_until_complete(qr_login_obj.wait())
+                            st.session_state.is_connected = True
+                            add_log("✅ ¡Login QR Exitoso!")
+                            st.success("Logueado. Recargando...")
+                            chats = loop.run_until_complete(fetch_chats(client_temp))
+                            st.session_state.chats = chats
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"El QR caducó o falló: {e}")
+                            add_log("❌ Error QR: Caducado o fallo.")
+
+                except Exception as e:
+                    st.error(f"Error inesperado: {e}")
+                    add_log(f"Error CRITICO: {e}")
+
+    # SELECTORES
+    if st.session_state.is_connected:
+        st.success("✅ CONECTADO")
+        opciones = list(st.session_state.chats.keys())
+        st.write("---")
+        col_ori, col_dest = st.columns(2)
+        with col_ori:
+            origen = st.selectbox("📤 Origen", opciones)
+        with col_dest:
+            destino = st.selectbox("📥 Destino", opciones)
+            
+        if st.button("🚀 INICIAR MIGRACIÓN", type="primary"):
+            if origen == destino:
+                st.error("Origen y destino son iguales")
+                add_log("❌ Error: Origen == Destino")
+            else:
+                add_log(f"Iniciando: {origen} -> {destino}")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                client = st.session_state.client
                 client.loop = loop
                 if not client.is_connected():
                     loop.run_until_complete(client.connect())
-
-                total_movidos = loop.run_until_complete(migrar(client, chat_ori, chat_dest, progress, status))
                 
-                status.empty()
+                chat_o = st.session_state.chats[origen]
+                chat_d = st.session_state.chats[destino]
+                
+                status_text = st.empty()
+                
+                total = loop.run_until_complete(run_migration(client, chat_o, chat_d, status_text))
+                
                 st.balloons()
-                st.success(f"🏁 ¡Proceso Terminado! Se movieron {total_movidos} archivos.")
-                
-    else:
-        st.error("No se pudieron cargar los chats. Intenta recargar la página.")
+                add_log(f"🏁 FIN. Total archivos: {total}")
+                st.success(f"Migración completada. {total} archivos.")
